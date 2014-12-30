@@ -158,10 +158,11 @@ bool loom_enqueue(struct loom *l, loom_task *t, size_t *backpressure) {
 }
 
 static void update_marked_commits(struct loom *l) {
-    size_t mask = l->mask;
+    const size_t mask = l->mask;
     for (;;) {
         size_t c = l->commit;
-        if (l->ring[c & mask].mark != c) { break; }
+        const size_t mark = l->ring[c & mask].mark;
+        if (mark != c) { break; }
         size_t d = l->done;
         if (CAS(&l->commit, c, c + 1)) {
             if (d > c) { LOG(0, "c %zd, d %zd\n", c, d); }
@@ -174,7 +175,8 @@ static void update_marked_commits(struct loom *l) {
 static void send_wakeup(struct loom *l) {
     for (int i = 0; i < l->cur_threads; i++) {
         thread_info *ti = &l->threads[i];
-        if (ti->state == LTS_ASLEEP) {
+        thread_state s = ti->state;
+        if (s == LTS_ASLEEP) {
             write(ti->wr_fd, "!", 1);
             break;
         }
@@ -417,10 +419,11 @@ static bool run_tasks(struct loom *l, thread_info *ti) {
 }
 
 static void update_marked_done(struct loom *l) {
-    size_t mask = l->mask;
+    const size_t mask = l->mask;
     for (;;) {
         size_t d = l->done;
-        if (l->ring[d & mask].mark != ~d) { break; }
+        const size_t mark = l->ring[d & mask].mark;
+        if (mark != ~d) { break; }
         if (CAS(&l->done, d, d + 1)) {
             size_t c = l->commit;
             if (d > c) { LOG(0, "c %zd, d %zd\n", c, d); }
