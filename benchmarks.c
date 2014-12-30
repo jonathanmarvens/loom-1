@@ -397,6 +397,7 @@ typedef struct {
 
 static void *multiprod_thread_task(void *arg);
 
+/* Stress multiple producers as well as multiple consumers. */
 static void bench_multiprod(config *cfg, struct loom *l) {
     size_t producers = cfg->arg2;
     if (producers == 0) { producers = 4; }
