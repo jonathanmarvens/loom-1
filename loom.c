@@ -41,11 +41,14 @@ loom_init_res loom_init(loom_config *cfg, struct loom **l) {
     if (pl == NULL) { return LOOM_INIT_RES_ERROR_MEMORY; }
 
     size_t ring_sz = (1 << cfg->ring_sz2);
-    loom_task *ring = calloc(ring_sz, sizeof(*ring));
+    ltask *ring = calloc(ring_sz, sizeof(*ring));
     if (ring == NULL) {
         free(pl);
         return LOOM_INIT_RES_ERROR_MEMORY;
     }
+
+    /* Avoid false positive from ring[0]->mark initialized to 0x0. */
+    ring[0].mark = 0xdeadda7a;
 
     pl->size = ring_sz;
     pl->mask = ring_sz - 1;
@@ -127,27 +130,48 @@ bool loom_enqueue(struct loom *l, loom_task *t, size_t *backpressure) {
         return false;
     }
 
+    /* Reserve write. */
     size_t w = 0;
     SPIN_INC(l->write, w);
-    
-    loom_task *qt = &l->ring[w & l->mask];
-    memcpy(qt, t, sizeof(*qt));
+
+    /* qt = &l->ring[w] is now reserved, and l->write is w + 1. */
+    ltask *qt = &l->ring[w & l->mask];
+    assert(qt->mark != w);      /* not yet marked */
+
+    memcpy(qt, t, sizeof(*t));  /* write task into queue */
+    assert(sizeof(*t) < sizeof(*qt));
 
     LOG(4, " -- saving %p(%zd), env %p\n",
         (void *)qt, w, (void *)t->env);
 
-    /* FIXME: SPIN_INC is insufficient here -- one thread can inc.
-     *     l->commit and commit another's write before it's ready.
-     *     We need to decouple marking as ready from the counter;
-     *     the same is likely to happen on the read -> release side. */
-    size_t c = 0;
-    SPIN_INC(l->commit, c);
-    LOG(4, " -- committed %zd\n", c);
+    qt->mark = w;               /* mark as committed */
+
+    /* Advance commit counter through marked cells. */
+    update_marked_commits(l);
+
     size_t bp = w - l->done;
     if (backpressure != NULL) { *backpressure = bp; }
     UNLOCK(l);
 
-    /* Send wakeup to first sleeping thread */
+    send_wakeup(l);
+    return true;
+}
+
+static void update_marked_commits(struct loom *l) {
+    size_t mask = l->mask;
+    for (;;) {
+        size_t c = l->commit;
+        if (l->ring[c & mask].mark != c) { break; }
+        size_t d = l->done;
+        if (CAS(&l->commit, c, c + 1)) {
+            if (d > c) { LOG(0, "c %zd, d %zd\n", c, d); }
+            assert(d <= c);
+        }
+    }
+}
+
+/* Send wakeup to first sleeping thread */
+static void send_wakeup(struct loom *l) {
     for (int i = 0; i < l->cur_threads; i++) {
         thread_info *ti = &l->threads[i];
         if (ti->state == LTS_ASLEEP) {
@@ -155,8 +179,6 @@ bool loom_enqueue(struct loom *l, loom_task *t, size_t *backpressure) {
             break;
         }
     }
-
-    return true;
 }
 
 /* Get statistics from the currently running thread pool. */
@@ -352,8 +374,8 @@ static bool spawn(struct loom *l, int id) {
 
 static bool run_tasks(struct loom *l, thread_info *ti) {
     bool work = false;
-    loom_task *qt = NULL;       /* task in queue */
-    loom_task t;                /* current task */
+    ltask *qt = NULL;           /* task in queue */
+    ltask t;                    /* current task */
 
     /* While work is available... */
     while (l->read < l->commit) {
@@ -366,14 +388,24 @@ static bool run_tasks(struct loom *l, thread_info *ti) {
             if (r == l->commit) { break; }
             LOCK(l);
             if (r < l->commit && CAS(&l->read, r, r + 1)) {
+                /* &l->ring[r & l->mask] is reserved, and read is r + 1 */
                 if (ti->state == LTS_ASLEEP) { ti->state = LTS_ACTIVE; }
+
                 qt = &l->ring[r & l->mask];
-                t = *qt;
+                if (qt->mark != r) {
+                    LOG(0, "??? mark == %zd (%zx), r == %zd (%zx)\n",
+                        qt->mark, qt->mark, r, r);
+                }
+                assert(qt->mark == r);
+                memcpy(&t, qt, sizeof(loom_task));
+
                 LOG(3, " -- running %p(%zd), env %p\n",
                     (void *)qt, r, (void *)t.env);
-                size_t d = l->done;
-                SPIN_INC(l->done, d);
-                
+
+                qt->mark = ~r;  /* mark as done */
+          
+                update_marked_done(l);
+
                 assert(t.task_cb != NULL);
                 t.task_cb(t.env);
                 work = true;
@@ -384,11 +416,24 @@ static bool run_tasks(struct loom *l, thread_info *ti) {
     return work;
 }
 
+static void update_marked_done(struct loom *l) {
+    size_t mask = l->mask;
+    for (;;) {
+        size_t d = l->done;
+        if (l->ring[d & mask].mark != ~d) { break; }
+        if (CAS(&l->done, d, d + 1)) {
+            size_t c = l->commit;
+            if (d > c) { LOG(0, "c %zd, d %zd\n", c, d); }
+            assert(d <= c);
+        }
+    }
+}
+
 static void clean_up_cancelled_tasks(thread_info *ti) {
     LOG(2, " -- cleanup for thread %p\n", (void *)pthread_self());
     struct loom *l = ti->l;
-    loom_task *qt = NULL;       /* task in queue */
-    loom_task t;                /* current task */
+    ltask *qt = NULL;           /* task in queue */
+    ltask t;                    /* current task */
     for (;;) {
         size_t r = l->read;
         if (r == l->commit) { break; }

@@ -61,6 +61,14 @@ typedef struct {
  *     D <= R <= C <= W
  */
 
+/* Annotated loom_task. */
+typedef struct {
+    loom_task_cb *task_cb;
+    loom_cleanup_cb *cleanup_cb;
+    void *env;
+    size_t mark;
+} ltask;
+
 typedef struct loom {
     #if LOOM_USE_LOCKING
     pthread_mutex_t lock;
@@ -76,7 +84,7 @@ typedef struct loom {
     uint16_t max_delay;         /* max poll(2) sleep for idle tasks */
     uint16_t cur_threads;       /* current live threads */
     uint16_t max_threads;       /* max # of threads to create */
-    loom_task *ring;            /* ring buffer */
+    ltask *ring;                /* ring buffer */
     thread_info threads[];      /* thread metadata */
 } loom;
 
@@ -94,6 +102,9 @@ static bool spawn(struct loom *l, int id);
 static void clean_up_cancelled_tasks(thread_info *ti);
 static alert_pipe_res read_alert_pipe(thread_info *ti,
     struct pollfd *pfd, int delay);
+static void send_wakeup(struct loom *l);
+static void update_marked_commits(struct loom *l);
+static void update_marked_done(struct loom *l);
 
 #ifndef LOOM_LOG_LEVEL
 #define LOOM_LOG_LEVEL 1
